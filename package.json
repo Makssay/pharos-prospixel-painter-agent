@@ -1,0 +1,14 @@
+{
+  "name": "pharos-prospixel-painter-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check ./.agents/skills/pharos-prospixel-painter-agent/scripts/prospixel-painter.mjs",
+    "demo:pixel": "node ./.agents/skills/pharos-prospixel-painter-agent/scripts/prospixel-painter.mjs --pixel \"822,285,#EF4444\" --offline --format console",
+    "demo:text": "node ./.agents/skills/pharos-prospixel-painter-agent/scripts/prospixel-painter.mjs --text \"PROS\" --x 820 --y 280 --color \"#EF4444\" --offline --format console"
+  },
+  "dependencies": {
+    "ethers": "^6.13.5"
+  }
+}
