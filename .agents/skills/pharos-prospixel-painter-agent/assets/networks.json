@@ -1,0 +1,31 @@
+{
+  "networks": [
+    {
+      "name": "mainnet",
+      "chainId": 1672,
+      "rpcUrl": "https://rpc.pharos.xyz",
+      "explorerUrl": "https://pharos.socialscan.io",
+      "nativeToken": "PROS",
+      "prosPixel": {
+        "contract": "0xf81Fb02F13917db6fa8f5A1F2e39a86EcE2A626a",
+        "bffBaseUrl": "https://bff.prospixel.xyz",
+        "appUrl": "https://prospixel.xyz",
+        "canvasSize": 1000
+      }
+    },
+    {
+      "name": "atlantic-testnet",
+      "chainId": 688689,
+      "rpcUrl": "https://atlantic.dplabs-internal.com",
+      "explorerUrl": "https://pharos.socialscan.io",
+      "nativeToken": "PHRS",
+      "prosPixel": {
+        "contract": "0x09d1D3cf60A86963c42ca159DA5D1a2D73644cf7",
+        "bffBaseUrl": "https://bff.prospixel.xyz",
+        "appUrl": "https://prospixel.xyz",
+        "canvasSize": 1000
+      }
+    }
+  ],
+  "defaultNetwork": "mainnet"
+}

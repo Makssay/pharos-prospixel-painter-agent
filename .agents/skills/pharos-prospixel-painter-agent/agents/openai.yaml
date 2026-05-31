@@ -1,0 +1,4 @@
+version: "1"
+display_name: "Pharos ProsPixel Painter Agent"
+short_description: "Plan and execute ProsPixel pixel purchases, cheap-pixel scans, and pixel-art drawing on Pharos."
+default_prompt: "Use $pharos-prospixel-painter-agent to plan a ProsPixel drawing on Pharos mainnet without executing it."
