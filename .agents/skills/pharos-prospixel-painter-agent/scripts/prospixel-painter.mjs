@@ -2,13 +2,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(__dirname, "..");
 const NETWORKS_PATH = path.join(SKILL_ROOT, "assets", "networks.json");
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const DEFAULT_COLOR = "#EF4444";
-const DEFAULT_MAX_PIXELS = 500;
+const CONTRACT_BATCH_PIXEL_LIMIT = 400;
+const DEFAULT_BATCH_SIZE = 400;
+const DEFAULT_MAX_PIXELS = 1000;
 const DEFAULT_MAX_SCAN_PIXELS = 2500;
 const DEFAULT_SCAN_CONCURRENCY = 8;
 
@@ -108,9 +111,7 @@ async function main() {
     throw new Error(`Pixel count ${normalizedPixels.length} exceeds --max-pixels ${args.maxPixels}.`);
   }
 
-  const xs = normalizedPixels.map((pixel) => pixel.x);
-  const ys = normalizedPixels.map((pixel) => pixel.y);
-  const colors = normalizedPixels.map((pixel) => pixel.colorInt);
+  const batches = chunkPixels(normalizedPixels, args.batchSize);
   const plan = {
     generatedAt: new Date().toISOString(),
     mode: args.execute ? "execute" : "plan",
@@ -119,6 +120,9 @@ async function main() {
     round: round.toString(),
     pixels: normalizedPixels,
     pixelCount: normalizedPixels.length,
+    batchSize: args.batchSize,
+    batchCount: batches.length,
+    batches: summarizeBatches(batches),
     bounds: getBounds(normalizedPixels),
     checks: [],
     warnings,
@@ -127,14 +131,22 @@ async function main() {
   };
 
   addCheck(plan, "OK", `Built ${normalizedPixels.length} ProsPixel pixel action(s).`);
+  addCheck(plan, "OK", `Split into ${batches.length} transaction batch(es): ${batches.map((batch) => batch.length).join(", ")} pixel(s).`);
   addCheck(plan, "OK", `Coordinates fit inside ${network.prosPixel.canvasSize}x${network.prosPixel.canvasSize} canvas.`);
   addCheck(plan, "OK", `Target contract: ${shortAddress(network.prosPixel.contract)} on ${network.name}.`);
 
   if (!args.offline && ethers && contract) {
-    const totalFee = await contract.getAllFeeAmounts(xs, ys);
+    const batchFees = await quoteBatchFees(contract, batches);
+    const totalFee = batchFees.reduce((sum, fee) => sum + fee, 0n);
     plan.estimates.totalValueWei = totalFee.toString();
     plan.estimates.totalValueNative = formatEther(totalFee);
-    addCheck(plan, "OK", `Contract fee quote fetched: ${formatEther(totalFee)} ${network.nativeToken}.`);
+    plan.estimates.batchValues = batchFees.map((fee, index) => ({
+      batch: index + 1,
+      pixels: batches[index].length,
+      valueWei: fee.toString(),
+      valueNative: formatEther(fee)
+    }));
+    addCheck(plan, "OK", `Contract fee quote fetched across ${batches.length} batch(es): ${formatEther(totalFee)} ${network.nativeToken}.`);
 
     if (args.maxTotalPros != null) {
       const cap = parseEtherDecimal(args.maxTotalPros);
@@ -154,10 +166,15 @@ async function main() {
       const balance = await provider.getBalance(fromAddress);
       plan.estimates.signerBalanceNative = formatEther(balance);
       addCheck(plan, balance > totalFee ? "OK" : "FAIL", `Signer balance: ${formatEther(balance)} ${network.nativeToken}.`);
-      const gasEstimate = await estimatePaintGas(provider, ethers, network, fromAddress, xs, ys, colors, totalFee, warnings);
-      if (gasEstimate != null) {
-        plan.estimates.gasEstimate = gasEstimate.toString();
-        addCheck(plan, "OK", `Gas estimate: ${gasEstimate.toString()}.`);
+      const gasEstimates = await estimatePaintGasBatches(provider, ethers, network, fromAddress, batches, batchFees, warnings);
+      if (gasEstimates.length) {
+        const gasTotal = gasEstimates.reduce((sum, gas) => sum + gas, 0n);
+        plan.estimates.gasEstimate = gasTotal.toString();
+        plan.estimates.batchGasEstimates = gasEstimates.map((gas, index) => ({
+          batch: index + 1,
+          gas: gas.toString()
+        }));
+        addCheck(plan, "OK", `Gas estimate across ${gasEstimates.length} batch(es): ${gasTotal.toString()}.`);
       }
     } else {
       warnings.push("No PRIVATE_KEY or --from address was provided; signer registration, balance, and gas checks were skipped.");
@@ -167,7 +184,7 @@ async function main() {
   }
 
   if (args.execute) {
-    const execution = await executePaint(args, network, ethers, provider, contract, xs, ys, colors, plan);
+    const execution = await executePaint(args, network, ethers, provider, contract, batches, plan);
     plan.execution = execution;
   }
 
@@ -188,6 +205,12 @@ function parseArgs(argv) {
     pixelSpecs: [],
     pixelsSpecs: [],
     csv: null,
+    image: null,
+    bounds: null,
+    fit: "contain",
+    transparentThreshold: 1,
+    maxImageColors: 0,
+    background: null,
     rect: null,
     text: null,
     x: null,
@@ -201,6 +224,7 @@ function parseArgs(argv) {
     allowLargeScan: false,
     scanConcurrency: DEFAULT_SCAN_CONCURRENCY,
     maxPixels: DEFAULT_MAX_PIXELS,
+    batchSize: DEFAULT_BATCH_SIZE,
     maxScanPixels: DEFAULT_MAX_SCAN_PIXELS,
     maxTotalPros: null,
     from: null,
@@ -240,6 +264,26 @@ function parseArgs(argv) {
       case "--pixels-file":
         args.csv = readValue(argv, ++i, arg);
         break;
+      case "--image":
+        args.image = readValue(argv, ++i, arg);
+        break;
+      case "--bounds":
+      case "--box":
+        args.bounds = readValue(argv, ++i, arg);
+        break;
+      case "--fit":
+        args.fit = readValue(argv, ++i, arg);
+        break;
+      case "--transparent-threshold":
+        args.transparentThreshold = Number(readValue(argv, ++i, arg));
+        break;
+      case "--max-image-colors":
+      case "--max-colors":
+        args.maxImageColors = Number(readValue(argv, ++i, arg));
+        break;
+      case "--background":
+        args.background = readValue(argv, ++i, arg);
+        break;
       case "--rect":
         args.rect = readValue(argv, ++i, arg);
         break;
@@ -278,6 +322,10 @@ function parseArgs(argv) {
         break;
       case "--max-pixels":
         args.maxPixels = Number(readValue(argv, ++i, arg));
+        break;
+      case "--batch-size":
+      case "--pixels-per-tx":
+        args.batchSize = Number(readValue(argv, ++i, arg));
         break;
       case "--max-scan-pixels":
         args.maxScanPixels = Number(readValue(argv, ++i, arg));
@@ -321,10 +369,18 @@ function parseArgs(argv) {
   if (!args.format) args.format = "markdown";
   if (!["markdown", "json", "console"].includes(args.format)) throw new Error("--format must be markdown, json, or console");
   if (!Number.isInteger(args.maxPixels) || args.maxPixels <= 0) throw new Error("--max-pixels must be a positive integer");
+  if (!Number.isInteger(args.batchSize) || args.batchSize <= 0) throw new Error("--batch-size must be a positive integer");
+  if (args.batchSize > CONTRACT_BATCH_PIXEL_LIMIT) {
+    throw new Error(`--batch-size cannot exceed ProsPixel contract/UI limit of ${CONTRACT_BATCH_PIXEL_LIMIT} pixels per transaction`);
+  }
   if (!Number.isInteger(args.maxScanPixels) || args.maxScanPixels <= 0) throw new Error("--max-scan-pixels must be a positive integer");
   if (!Number.isInteger(args.scale) || args.scale <= 0) throw new Error("--scale must be a positive integer");
   if (!Number.isInteger(args.sampleStep) || args.sampleStep <= 0) throw new Error("--sample-step must be a positive integer");
   if (!Number.isInteger(args.scanConcurrency) || args.scanConcurrency <= 0) throw new Error("--scan-concurrency must be a positive integer");
+  if (!["contain", "cover", "stretch"].includes(args.fit)) throw new Error("--fit must be contain, cover, or stretch");
+  if (!Number.isInteger(args.transparentThreshold) || args.transparentThreshold < 0 || args.transparentThreshold > 255) throw new Error("--transparent-threshold must be 0..255");
+  if (!Number.isInteger(args.maxImageColors) || args.maxImageColors < 0) throw new Error("--max-image-colors must be 0 or a positive integer");
+  if (args.background) args.background = normalizeColor(args.background);
   return args;
 }
 
@@ -404,6 +460,7 @@ async function buildPixelPlan(args, network, round, warnings) {
     }
   }
   if (args.csv) pixels.push(...readCsvPixels(args.csv, args.color));
+  if (args.image) pixels.push(...buildImagePixels(args, warnings));
   if (args.rect) pixels.push(...buildRectPixels(args.rect, args.color));
   if (args.text != null) pixels.push(...buildTextPixels(args.text, args.x, args.y, args.color, args.scale));
   if (args.cheapest) {
@@ -432,6 +489,263 @@ function readCsvPixels(filePath, fallbackColor) {
     rows.push(parsePixelSpec(trimmed, fallbackColor));
   }
   return rows;
+}
+
+function buildImagePixels(args, warnings) {
+  if (!args.bounds) throw new Error("--image requires --bounds x1,y1,x2,y2");
+  const [x1, y1, x2, y2] = parseNumberList(args.bounds, 4, "--bounds");
+  const minX = Math.min(x1, x2);
+  const maxX = Math.max(x1, x2);
+  const minY = Math.min(y1, y2);
+  const maxY = Math.max(y1, y2);
+  const targetWidth = maxX - minX + 1;
+  const targetHeight = maxY - minY + 1;
+  if (targetWidth <= 0 || targetHeight <= 0) throw new Error("--bounds must define a positive area");
+
+  const image = decodePng(args.image);
+  const fit = computeImageFit(image.width, image.height, targetWidth, targetHeight, args.fit);
+  const background = args.background ? hexToRgb(args.background) : null;
+  const pixels = [];
+
+  for (let ty = 0; ty < targetHeight; ty += 1) {
+    for (let tx = 0; tx < targetWidth; tx += 1) {
+      const src = mapTargetToSource(tx, ty, image.width, image.height, fit);
+      if (!src) continue;
+      const rgba = getRgba(image, src.x, src.y);
+      if (rgba.a < args.transparentThreshold && !background) continue;
+      const blended = background ? blendOverBackground(rgba, background) : rgba;
+      pixels.push({
+        x: minX + tx,
+        y: minY + ty,
+        color: rgbToHex(blended.r, blended.g, blended.b)
+      });
+    }
+  }
+
+  const quantized = args.maxImageColors > 0 ? quantizePixelColors(pixels, args.maxImageColors) : pixels;
+  warnings.push(`Loaded PNG ${path.basename(args.image)} (${image.width}x${image.height}) into bounds ${minX},${minY}..${maxX},${maxY} using fit=${args.fit}.`);
+  if (quantized.length !== pixels.length) warnings.push(`Image transparency skipped ${targetWidth * targetHeight - pixels.length} target pixel(s).`);
+  if (args.maxImageColors > 0) warnings.push(`Reduced image colors to at most ${args.maxImageColors}.`);
+  return quantized;
+}
+
+function decodePng(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (buffer.length < 8 || !buffer.subarray(0, 8).equals(signature)) {
+    throw new Error("--image currently supports PNG files only. Convert the image to PNG first.");
+  }
+
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  let palette = null;
+  let transparency = null;
+  const idat = [];
+
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString("ascii", offset + 4, offset + 8);
+    const data = buffer.subarray(offset + 8, offset + 8 + length);
+    offset += 12 + length;
+    if (type === "IHDR") {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+      interlace = data[12];
+    } else if (type === "PLTE") {
+      palette = data;
+    } else if (type === "tRNS") {
+      transparency = data;
+    } else if (type === "IDAT") {
+      idat.push(data);
+    } else if (type === "IEND") {
+      break;
+    }
+  }
+
+  if (bitDepth !== 8) throw new Error(`Unsupported PNG bit depth ${bitDepth}. Use an 8-bit PNG.`);
+  if (interlace !== 0) throw new Error("Interlaced PNG is not supported. Re-export as non-interlaced PNG.");
+  if (![0, 2, 3, 4, 6].includes(colorType)) throw new Error(`Unsupported PNG color type ${colorType}.`);
+  if (colorType === 3 && !palette) throw new Error("Indexed PNG is missing PLTE palette.");
+
+  const channels = pngChannels(colorType);
+  const bytesPerPixel = channels;
+  const scanlineLength = width * channels;
+  const inflated = zlib.inflateSync(Buffer.concat(idat));
+  const raw = Buffer.alloc(width * height * channels);
+  let inOffset = 0;
+  let prev = Buffer.alloc(scanlineLength);
+
+  for (let y = 0; y < height; y += 1) {
+    const filter = inflated[inOffset];
+    inOffset += 1;
+    const line = Buffer.from(inflated.subarray(inOffset, inOffset + scanlineLength));
+    inOffset += scanlineLength;
+    unfilterLine(line, prev, bytesPerPixel, filter);
+    line.copy(raw, y * scanlineLength);
+    prev = line;
+  }
+
+  return { width, height, bitDepth, colorType, channels, raw, palette, transparency };
+}
+
+function pngChannels(colorType) {
+  if (colorType === 0) return 1;
+  if (colorType === 2) return 3;
+  if (colorType === 3) return 1;
+  if (colorType === 4) return 2;
+  if (colorType === 6) return 4;
+  throw new Error(`Unsupported PNG color type ${colorType}`);
+}
+
+function unfilterLine(line, prev, bpp, filter) {
+  for (let i = 0; i < line.length; i += 1) {
+    const left = i >= bpp ? line[i - bpp] : 0;
+    const up = prev[i] || 0;
+    const upLeft = i >= bpp ? prev[i - bpp] || 0 : 0;
+    if (filter === 0) {
+      continue;
+    } else if (filter === 1) {
+      line[i] = (line[i] + left) & 0xff;
+    } else if (filter === 2) {
+      line[i] = (line[i] + up) & 0xff;
+    } else if (filter === 3) {
+      line[i] = (line[i] + Math.floor((left + up) / 2)) & 0xff;
+    } else if (filter === 4) {
+      line[i] = (line[i] + paethPredictor(left, up, upLeft)) & 0xff;
+    } else {
+      throw new Error(`Unsupported PNG filter ${filter}`);
+    }
+  }
+}
+
+function paethPredictor(a, b, c) {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+function computeImageFit(srcWidth, srcHeight, targetWidth, targetHeight, mode) {
+  if (mode === "stretch") {
+    return { drawWidth: targetWidth, drawHeight: targetHeight, offsetX: 0, offsetY: 0, scaleX: srcWidth / targetWidth, scaleY: srcHeight / targetHeight };
+  }
+  const scale = mode === "cover"
+    ? Math.max(targetWidth / srcWidth, targetHeight / srcHeight)
+    : Math.min(targetWidth / srcWidth, targetHeight / srcHeight);
+  const drawWidth = Math.max(1, Math.round(srcWidth * scale));
+  const drawHeight = Math.max(1, Math.round(srcHeight * scale));
+  return {
+    drawWidth,
+    drawHeight,
+    offsetX: Math.floor((targetWidth - drawWidth) / 2),
+    offsetY: Math.floor((targetHeight - drawHeight) / 2),
+    scaleX: srcWidth / drawWidth,
+    scaleY: srcHeight / drawHeight
+  };
+}
+
+function mapTargetToSource(tx, ty, srcWidth, srcHeight, fit) {
+  const localX = tx - fit.offsetX;
+  const localY = ty - fit.offsetY;
+  if (localX < 0 || localY < 0 || localX >= fit.drawWidth || localY >= fit.drawHeight) return null;
+  const x = clamp(Math.floor(localX * fit.scaleX), 0, srcWidth - 1);
+  const y = clamp(Math.floor(localY * fit.scaleY), 0, srcHeight - 1);
+  return { x, y };
+}
+
+function getRgba(image, x, y) {
+  const idx = (y * image.width + x) * image.channels;
+  if (image.colorType === 0) {
+    const v = image.raw[idx];
+    return { r: v, g: v, b: v, a: 255 };
+  }
+  if (image.colorType === 2) {
+    return { r: image.raw[idx], g: image.raw[idx + 1], b: image.raw[idx + 2], a: 255 };
+  }
+  if (image.colorType === 3) {
+    const p = image.raw[idx];
+    const pi = p * 3;
+    return {
+      r: image.palette[pi],
+      g: image.palette[pi + 1],
+      b: image.palette[pi + 2],
+      a: image.transparency && p < image.transparency.length ? image.transparency[p] : 255
+    };
+  }
+  if (image.colorType === 4) {
+    const v = image.raw[idx];
+    return { r: v, g: v, b: v, a: image.raw[idx + 1] };
+  }
+  return { r: image.raw[idx], g: image.raw[idx + 1], b: image.raw[idx + 2], a: image.raw[idx + 3] };
+}
+
+function blendOverBackground(rgba, bg) {
+  const a = rgba.a / 255;
+  return {
+    r: Math.round(rgba.r * a + bg.r * (1 - a)),
+    g: Math.round(rgba.g * a + bg.g * (1 - a)),
+    b: Math.round(rgba.b * a + bg.b * (1 - a))
+  };
+}
+
+function quantizePixelColors(pixels, maxColors) {
+  if (!maxColors || maxColors <= 0) return pixels;
+  const counts = new Map();
+  for (const pixel of pixels) counts.set(pixel.color, (counts.get(pixel.color) || 0) + 1);
+  const palette = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, maxColors)
+    .map(([color]) => color);
+  if (!palette.length) return pixels;
+  return pixels.map((pixel) => ({
+    ...pixel,
+    color: nearestPaletteColor(pixel.color, palette)
+  }));
+}
+
+function nearestPaletteColor(color, palette) {
+  const rgb = hexToRgb(color);
+  let best = palette[0];
+  let bestDistance = Infinity;
+  for (const candidate of palette) {
+    const c = hexToRgb(candidate);
+    const d = (rgb.r - c.r) ** 2 + (rgb.g - c.g) ** 2 + (rgb.b - c.b) ** 2;
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function hexToRgb(color) {
+  const normalized = normalizeColor(color);
+  return {
+    r: Number.parseInt(normalized.slice(1, 3), 16),
+    g: Number.parseInt(normalized.slice(3, 5), 16),
+    b: Number.parseInt(normalized.slice(5, 7), 16)
+  };
+}
+
+function rgbToHex(r, g, b) {
+  return `#${toHexByte(r)}${toHexByte(g)}${toHexByte(b)}`.toUpperCase();
+}
+
+function toHexByte(value) {
+  return clamp(Math.round(value), 0, 255).toString(16).padStart(2, "0");
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function buildRectPixels(rectSpec, color) {
@@ -559,6 +873,39 @@ function normalizePixels(pixels, canvasSize) {
   return [...map.values()].sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
+function chunkPixels(pixels, batchSize) {
+  const chunks = [];
+  for (let i = 0; i < pixels.length; i += batchSize) {
+    chunks.push(pixels.slice(i, i + batchSize));
+  }
+  return chunks;
+}
+
+function summarizeBatches(batches) {
+  return batches.map((batch, index) => ({
+    index: index + 1,
+    pixels: batch.length,
+    bounds: getBounds(batch)
+  }));
+}
+
+function batchArrays(batch) {
+  return {
+    xs: batch.map((pixel) => pixel.x),
+    ys: batch.map((pixel) => pixel.y),
+    colors: batch.map((pixel) => pixel.colorInt)
+  };
+}
+
+async function quoteBatchFees(contract, batches) {
+  const fees = [];
+  for (const batch of batches) {
+    const { xs, ys } = batchArrays(batch);
+    fees.push(await contract.getAllFeeAmounts(xs, ys));
+  }
+  return fees;
+}
+
 function normalizeColor(value) {
   let color = String(value || DEFAULT_COLOR).trim();
   if (color.startsWith("0x")) color = `#${color.slice(2)}`;
@@ -592,22 +939,26 @@ async function resolveFromAddress(args, ethers) {
   return new ethers.Wallet(key).address;
 }
 
-async function estimatePaintGas(provider, ethers, network, from, xs, ys, colors, value, warnings) {
-  try {
-    const iface = new ethers.Interface(PROS_PIXEL_ABI);
-    return await provider.estimateGas({
-      from,
-      to: network.prosPixel.contract,
-      value,
-      data: iface.encodeFunctionData("batchBuyPixels", [xs, ys, colors])
-    });
-  } catch (error) {
-    warnings.push(`Gas estimate failed: ${error.shortMessage || error.message}`);
-    return null;
+async function estimatePaintGasBatches(provider, ethers, network, from, batches, batchFees, warnings) {
+  const iface = new ethers.Interface(PROS_PIXEL_ABI);
+  const estimates = [];
+  for (let i = 0; i < batches.length; i += 1) {
+    const { xs, ys, colors } = batchArrays(batches[i]);
+    try {
+      estimates.push(await provider.estimateGas({
+        from,
+        to: network.prosPixel.contract,
+        value: batchFees[i],
+        data: iface.encodeFunctionData("batchBuyPixels", [xs, ys, colors])
+      }));
+    } catch (error) {
+      warnings.push(`Gas estimate failed for batch ${i + 1}: ${error.shortMessage || error.message}`);
+    }
   }
+  return estimates;
 }
 
-async function executePaint(args, network, loadedEthers, loadedProvider, loadedContract, xs, ys, colors, plan) {
+async function executePaint(args, network, loadedEthers, loadedProvider, loadedContract, batches, plan) {
   if (!args.yes) throw new Error("--execute requires --yes after explicit user confirmation");
   if (network.name === "mainnet" && !args.confirmMainnet) throw new Error("mainnet execution requires --confirm-mainnet");
   const ethers = loadedEthers || await loadEthers(true);
@@ -617,35 +968,60 @@ async function executePaint(args, network, loadedEthers, loadedProvider, loadedC
   if (!privateKey) throw new Error("--execute requires PRIVATE_KEY in the local environment or .env");
   const wallet = new ethers.Wallet(privateKey, provider);
   const contract = (loadedContract || new ethers.Contract(network.prosPixel.contract, PROS_PIXEL_ABI, provider)).connect(wallet);
-  const totalFee = plan.estimates.totalValueWei != null
+  const plannedTotalFee = plan.estimates.totalValueWei != null
     ? BigInt(plan.estimates.totalValueWei)
-    : await contract.getAllFeeAmounts(xs, ys);
+    : (await quoteBatchFees(contract, batches)).reduce((sum, fee) => sum + fee, 0n);
 
-  if (args.maxTotalPros != null && totalFee > parseEtherDecimal(args.maxTotalPros)) {
-    throw new Error(`Refusing execution: total value ${formatEther(totalFee)} exceeds --max-total-pros ${args.maxTotalPros}`);
+  if (args.maxTotalPros != null && plannedTotalFee > parseEtherDecimal(args.maxTotalPros)) {
+    throw new Error(`Refusing execution: planned total value ${formatEther(plannedTotalFee)} exceeds --max-total-pros ${args.maxTotalPros}`);
   }
 
   const registered = await contract.isRegistered(wallet.address);
   if (!registered) throw new Error(`Signer ${wallet.address} is not registered in ProsPixel. Register in the app first, then retry.`);
   const balance = await provider.getBalance(wallet.address);
-  if (balance <= totalFee) throw new Error(`Signer balance ${formatEther(balance)} ${network.nativeToken} is not enough for pixel value plus gas.`);
+  if (balance <= plannedTotalFee) throw new Error(`Signer balance ${formatEther(balance)} ${network.nativeToken} is not enough for pixel value plus gas.`);
 
-  const gas = await contract.batchBuyPixels.estimateGas(xs, ys, colors, { value: totalFee });
-  const tx = await contract.batchBuyPixels(xs, ys, colors, {
-    value: totalFee,
-    gasLimit: gas * 120n / 100n
-  });
-  const receipt = await tx.wait();
   const explorerBase = network.explorerUrl.replace(/\/$/, "");
+  const batchResults = [];
+  let spent = 0n;
+  const cap = args.maxTotalPros != null ? parseEtherDecimal(args.maxTotalPros) : null;
+
+  for (let i = 0; i < batches.length; i += 1) {
+    const { xs, ys, colors } = batchArrays(batches[i]);
+    const batchFee = await contract.getAllFeeAmounts(xs, ys);
+    if (cap != null && spent + batchFee > cap) {
+      throw new Error(`Refusing batch ${i + 1}: cumulative value ${formatEther(spent + batchFee)} exceeds --max-total-pros ${args.maxTotalPros}`);
+    }
+    const gas = await contract.batchBuyPixels.estimateGas(xs, ys, colors, { value: batchFee });
+    const tx = await contract.batchBuyPixels(xs, ys, colors, {
+      value: batchFee,
+      gasLimit: gas * 120n / 100n
+    });
+    const receipt = await tx.wait();
+    spent += batchFee;
+    batchResults.push({
+      batch: i + 1,
+      pixels: batches[i].length,
+      status: receipt?.status === 1 ? "success" : "failed",
+      transactionHash: tx.hash,
+      blockNumber: receipt?.blockNumber ?? null,
+      gasUsed: receipt?.gasUsed?.toString() ?? null,
+      valueWei: batchFee.toString(),
+      valueNative: formatEther(batchFee),
+      explorerTxUrl: `${explorerBase}/tx/${tx.hash}`
+    });
+    if (receipt?.status !== 1) throw new Error(`Batch ${i + 1} transaction failed: ${tx.hash}`);
+  }
+
   return {
-    status: receipt?.status === 1 ? "success" : "failed",
+    status: batchResults.every((batch) => batch.status === "success") ? "success" : "failed",
     signer: wallet.address,
-    transactionHash: tx.hash,
-    blockNumber: receipt?.blockNumber ?? null,
-    gasUsed: receipt?.gasUsed?.toString() ?? null,
-    totalValueWei: totalFee.toString(),
-    totalValueNative: formatEther(totalFee),
-    explorerTxUrl: `${explorerBase}/tx/${tx.hash}`
+    batchCount: batchResults.length,
+    totalValueWei: spent.toString(),
+    totalValueNative: formatEther(spent),
+    batches: batchResults,
+    transactionHash: batchResults[0]?.transactionHash || null,
+    explorerTxUrl: batchResults[0]?.explorerTxUrl || null
   };
 }
 
@@ -684,6 +1060,7 @@ function renderMarkdown(plan, args) {
   lines.push("");
   lines.push("## Summary", "");
   lines.push(`- Pixels: ${plan.pixelCount}`);
+  lines.push(`- Transaction batches: ${plan.batchCount} (${plan.batches.map((batch) => batch.pixels).join(" + ")} pixels)`);
   lines.push(`- Bounds: x ${plan.bounds.minX}..${plan.bounds.maxX}, y ${plan.bounds.minY}..${plan.bounds.maxY}`);
   if (plan.estimates.totalValueNative) lines.push(`- Total value: ${plan.estimates.totalValueNative} ${plan.network.nativeToken}`);
   if (plan.estimates.gasEstimate) lines.push(`- Gas estimate: ${plan.estimates.gasEstimate}`);
@@ -708,8 +1085,11 @@ function renderMarkdown(plan, args) {
   if (plan.execution) {
     lines.push("", "## Execution", "");
     lines.push(`- Status: ${plan.execution.status}`);
-    lines.push(`- Transaction: \`${plan.execution.transactionHash}\``);
-    lines.push(`- Explorer: ${plan.execution.explorerTxUrl}`);
+    lines.push(`- Batches: ${plan.execution.batchCount}`);
+    lines.push(`- Total value: ${plan.execution.totalValueNative} ${plan.network.nativeToken}`);
+    for (const batch of plan.execution.batches || []) {
+      lines.push(`- Batch ${batch.batch}: ${batch.pixels} pixels, \`${batch.transactionHash}\`, ${batch.explorerTxUrl}`);
+    }
   }
   lines.push("", "_Dry-run by default. Real painting requires --execute --yes and a local PRIVATE_KEY._");
   return `${lines.join("\n")}\n`;
@@ -725,6 +1105,7 @@ function renderConsole(plan, args) {
   lines.push(`Round: ${plan.round}`);
   lines.push("");
   lines.push(`Pixels: ${plan.pixelCount}`);
+  lines.push(`Batches: ${plan.batchCount} (${plan.batches.map((batch) => batch.pixels).join(" + ")} pixels)`);
   lines.push(`Bounds: x ${plan.bounds.minX}..${plan.bounds.maxX}, y ${plan.bounds.minY}..${plan.bounds.maxY}`);
   if (plan.estimates.totalValueNative) lines.push(`Total: ${plan.estimates.totalValueNative} ${plan.network.nativeToken}`);
   if (plan.estimates.gasEstimate) lines.push(`Gas estimate: ${plan.estimates.gasEstimate}`);
@@ -751,8 +1132,12 @@ function renderConsole(plan, args) {
   if (plan.execution) {
     lines.push("");
     lines.push(`Execution: ${plan.execution.status}`);
-    lines.push(`Tx: ${plan.execution.transactionHash}`);
-    lines.push(`Explorer: ${plan.execution.explorerTxUrl}`);
+    lines.push(`Batches sent: ${plan.execution.batchCount}`);
+    lines.push(`Total spent: ${plan.execution.totalValueNative} ${plan.network.nativeToken}`);
+    for (const batch of plan.execution.batches || []) {
+      lines.push(`Batch ${batch.batch}: ${batch.pixels} pixels | tx ${batch.transactionHash}`);
+      lines.push(`Explorer: ${batch.explorerTxUrl}`);
+    }
   }
   return `${lines.join("\n")}\n`;
 }
@@ -812,9 +1197,11 @@ Inputs:
   --pixel x,y,#RRGGBB
   --pixels "x,y,#RRGGBB;x,y,#RRGGBB"
   --csv pixels.csv
+  --image image.png --bounds x1,y1,x2,y2 [--fit contain|cover|stretch]
   --rect x1,y1,x2,y2 --color #RRGGBB
   --text "TEXT" --x N --y N --color #RRGGBB [--scale N]
   --cheapest --limit N --area x1,y1,x2,y2 --color #RRGGBB
+  --batch-size N (default 400, maximum 400)
   --execute --yes [--confirm-mainnet]
   --max-total-pros N
   --format markdown|json|console
